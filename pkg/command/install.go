@@ -36,8 +36,10 @@ func getInstallCommand() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "install [OPTIONS]",
-		Short: "Install the egress watcher in Kubernetes",
+		Use: "install [OPTIONS]",
+		Short: `Install the egress watcher in Kubernetes.
+
+This is an experimental feature.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			home := homedir.HomeDir()
 			if home == "" {
@@ -104,7 +106,6 @@ func install(clientset *kubernetes.Clientset, user, pass, url string) error {
 }
 
 func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
-
 	//Take inputs from user
 	fmt.Println("Hi user , please enter your sdwan username :")
 	var sdwan_username string
@@ -133,36 +134,4 @@ func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
 	createDeployment(clientset, "new-deployment", usernamespace, defaultImage)
 
 	return nil
-	// usersettingsfilename := "./settings.yaml"
-
-	// if err != nil {
-	// 	fmt.Printf("%s, %s", err, out)
-	// }
-	// fmt.Println("Command Successfully Executed")
-
-	// //template_yaml(clientset, "new-deployment", usernamespace)
-	// //CreateDeployment(clientset, "new-deployment", usernamespace)
-	// CreateSecret(clientset, usernamespace, "vmanage-credentials", sdwan_username, sdwan_pass)
-	// CreateConfigMap(clientset, usernamespace, "egress-watcher-settings", usersettingsfilename, sdwan_url, sdwan_username, sdwan_pass)
-	// CreateServiceAccount(clientset, usernamespace, "egress-watcher-service-account")
-	// CreateClusterRole(clientset, usernamespace, "egress-watcher-role")
-	// CreateClusterRoleBinding(clientset, usernamespace, "egress-watcher-role-binding")
-	// CreateDeployment(clientset, "new-deployment", usernamespace)
-
-	/*sleepcmd := "sleep 2"
-	out1, err1 := exec.Command("sleep","2").Output()
-
-	if err1 != nil {
-		fmt.Printf("%s, %s", err1, out1)
-	}
-	fmt.Println("Command Successfully Executed")
-
-	setimage := "kubectl set image deployment/egress-watcher egress-watcher=" + "os.ExpandEnv('$IMAGE') -n egress-watcher"
-	cmd3 := strings.Split(setimage, "")
-	execute(cmd3)
-
-	setpodname := "export POD_NAME=$(kubectl get pods --template '{{range .items}}{{.metadata.name}}{{\"\n\"}}{{end}}' -n egress-watcher | grep egress-watcher)"
-	fmt.Println(setpodname)
-	*/
-
 }

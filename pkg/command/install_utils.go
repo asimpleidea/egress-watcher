@@ -1,3 +1,20 @@
+// Copyright (c) 2022 Cisco Systems, Inc. and its affiliates
+// All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package command
 
 import (
@@ -15,6 +32,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+// TODO: these functions will return an error instead of just printing it. This
+// will be done in future commits.
 
 func createNamespace(clientset *kubernetes.Clientset, usernamespace string) {
 	ns := &apiv1.Namespace{
@@ -41,8 +61,6 @@ func createServiceAccount(clientset *kubernetes.Clientset, usernamespace, name s
 	}
 
 	serviceAccountOut, err := clientset.CoreV1().ServiceAccounts(usernamespace).Create(context.TODO(), servacc, metav1.CreateOptions{})
-
-	//secretOut, err := kubeClient.clientset.CoreV1().Secrets(cr.Namespace).Create(secret)
 	if err != nil {
 		fmt.Println("ERROR:", err)
 	}
@@ -167,10 +185,8 @@ func createSecret(clientset *kubernetes.Clientset, usernamespace, name, sdwan_us
 		Type: "Opaque",
 	}
 
-	//clientset := clientset.Interface
 	secretOut, err := clientset.CoreV1().Secrets(usernamespace).Create(context.TODO(), secr, metav1.CreateOptions{})
 
-	//secretOut, err := kubeClient.clientset.CoreV1().Secrets(cr.Namespace).Create(secret)
 	if err != nil {
 		fmt.Println("ERROR:", err)
 	}
@@ -178,8 +194,6 @@ func createSecret(clientset *kubernetes.Clientset, usernamespace, name, sdwan_us
 }
 
 func createDeployment(clientset *kubernetes.Clientset, sdwan_url string, usernamespace string, image string) {
-
-	//deploymentsClient := clientset.AppsV1().Deployments(apiv1.NamespaceDefault)
 	deploymentsClient := clientset.AppsV1().Deployments(usernamespace)
 
 	deployment := &appsv1.Deployment{
@@ -283,94 +297,3 @@ func createDeployment(clientset *kubernetes.Clientset, sdwan_url string, usernam
 	fmt.Printf("Created deployment %q.\n", result.GetObjectMeta().GetName())
 
 }
-
-// func main() {
-// 	var kubeconfig *string
-// 	if home := homedir.HomeDir(); home != "" {
-// 		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the clientset file")
-// 	} else {
-// 		kubeconfig = flag.String("kubeconfig", "", "absolute path to the clientset file")
-// 	}
-// 	flag.Parse()
-
-// 	// use the current context in clientset
-// 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
-// 	if err != nil {
-// 		panic(err.Error())
-// 	}
-
-// 	// create the clientset
-// 	clientset, err := kubernetes.NewForConfig(config)
-// 	if err != nil {
-// 		return fmt.Errorf("canno")
-// 	}
-
-// 	//Take inputs from user
-// 	fmt.Println("Hi user , please enter your sdwan username :")
-// 	scanner := bufio.NewScanner(os.Stdin)
-// 	scanner.Scan()
-// 	err = scanner.Err()
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	sdwan_username := scanner.Text()
-// 	//fmt.Printf("read line: %s-\n", sdwan_username)
-
-// 	// enter password
-// 	fmt.Println("Please enter your sdwan password :")
-// 	scanner_pass := bufio.NewScanner(os.Stdin)
-// 	scanner_pass.Scan()
-// 	error := scanner_pass.Err()
-// 	if error != nil {
-// 		log.Fatal(error)
-// 	}
-// 	sdwan_pass := scanner_pass.Text()
-// 	//fmt.Printf("read line: %s-\n", sdwan_pass)
-
-// 	//enter base_url
-// 	fmt.Println("Please enter your sdwan base_url :")
-// 	scanner_url := bufio.NewScanner(os.Stdin)
-// 	scanner_url.Scan()
-// 	error_url := scanner_url.Err()
-// 	if error_url != nil {
-// 		log.Fatal(error_url)
-// 	}
-// 	sdwan_url := scanner_url.Text()
-// 	fmt.Printf("read line: %s", sdwan_url)
-
-// 	usernamespace := "egress-watcher"
-// 	usersettingsfilename := "./settings.yaml"
-// 	//nscreation := "kubectl create ns egress-watcher"
-// 	out, err := exec.Command("kubectl", "create", "ns", "egress-watcher").Output()
-
-// 	if err != nil {
-// 		fmt.Printf("%s, %s", err, out)
-// 	}
-// 	fmt.Println("Command Successfully Executed")
-
-// 	//template_yaml(clientset, "new-deployment", usernamespace)
-// 	//CreateDeployment(clientset, "new-deployment", usernamespace)
-// 	CreateSecret(clientset, usernamespace, "vmanage-credentials", sdwan_username, sdwan_pass)
-// 	CreateConfigMap(clientset, usernamespace, "egress-watcher-settings", usersettingsfilename, sdwan_url, sdwan_username, sdwan_pass)
-// 	CreateServiceAccount(clientset, usernamespace, "egress-watcher-service-account")
-// 	CreateClusterRole(clientset, usernamespace, "egress-watcher-role")
-// 	CreateClusterRoleBinding(clientset, usernamespace, "egress-watcher-role-binding")
-// 	CreateDeployment(clientset, "new-deployment", usernamespace)
-
-// 	/*sleepcmd := "sleep 2"
-// 	out1, err1 := exec.Command("sleep","2").Output()
-
-// 	if err1 != nil {
-// 		fmt.Printf("%s, %s", err1, out1)
-// 	}
-// 	fmt.Println("Command Successfully Executed")
-
-// 	setimage := "kubectl set image deployment/egress-watcher egress-watcher=" + "os.ExpandEnv('$IMAGE') -n egress-watcher"
-// 	cmd3 := strings.Split(setimage, "")
-// 	execute(cmd3)
-
-// 	setpodname := "export POD_NAME=$(kubectl get pods --template '{{range .items}}{{.metadata.name}}{{\"\n\"}}{{end}}' -n egress-watcher | grep egress-watcher)"
-// 	fmt.Println(setpodname)
-// 	*/
-
-// }
