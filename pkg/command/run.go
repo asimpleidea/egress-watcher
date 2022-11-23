@@ -31,6 +31,7 @@ import (
 	"github.com/CloudNativeSDWAN/egress-watcher/pkg/controllers"
 	"github.com/CloudNativeSDWAN/egress-watcher/pkg/sdwan"
 	"github.com/CloudNativeSDWAN/egress-watcher/pkg/sdwan/vmanage"
+	vmanagego "github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -84,7 +85,7 @@ func getRunCommand() *cobra.Command {
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				fmt.Println(`no sdwan controller defined. Please include -h for a list of supported SD-WAN controllers.`)
-				return fmt.Errorf("no sdwan controller provided.")
+				return fmt.Errorf("no sdwan controller provided")
 			}
 
 			if len(args) > 1 {
@@ -165,7 +166,8 @@ The following controllers are supported:
 			case "vmanage":
 				return runWithVmanage(kopts, opts)
 			default:
-				return fmt.Errorf("no sdwan controller provided.")
+				// TODO: rephrasing
+				return fmt.Errorf("no valid sdwan controller provided")
 			}
 		},
 		Example: "run --kubeconfig /my/kubeconf/.conf --watch-all-service-entries",
@@ -216,7 +218,8 @@ func runWithVmanage(kopts *kubeConfigOptions, opts *Options) error {
 			zerolog.ErrorLevel,
 		}
 
-		if opts.Verbosity < 0 || opts.Verbosity > 3 {
+		// FIXME: max verbosity is 2 not 3
+		if opts.Verbosity < 0 || opts.Verbosity > 2 {
 			fmt.Println("invalid verbosity level provided, using default")
 			opts.Verbosity = defaultVerbosity
 		}
@@ -253,8 +256,14 @@ func runWithVmanage(kopts *kubeConfigOptions, opts *Options) error {
 
 		log.Info().Msg("getting client...")
 
+		vopts := []vmanagego.ClientOption{}
+		if opts.Sdwan.Insecure {
+			vopts = append(vopts, vmanagego.WithSkipInsecure())
+		}
+
 		vctx, vcanc := context.WithTimeout(ctx, 30*time.Second)
-		vclient, err := vmanage.NewClient(vctx, opts.Sdwan)
+		vclient, err := vmanagego.NewClient(vctx, opts.Sdwan.BaseURL,
+			opts.Sdwan.Authentication.Username, opts.Sdwan.Authentication.Password, vopts...)
 		vcanc()
 		if err != nil {
 			log.Err(err).Msg("could not get client")
@@ -275,7 +284,8 @@ func runWithVmanage(kopts *kubeConfigOptions, opts *Options) error {
 		go func() {
 			defer close(exitWatch)
 
-			if err = vclient.WatchForOperations(ctx, opsChan, *opts.Sdwan.WaitingWindow, log); err != nil {
+			opsHandler := vmanage.NewOperationsHandler(vclient, *opts.Sdwan.WaitingWindow, log)
+			if err = opsHandler.WatchForOperations(ctx, opsChan); err != nil {
 				log.Err(err).Msg("error while watch for operations")
 				return
 			}

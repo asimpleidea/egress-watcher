@@ -89,6 +89,7 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 		return
 	}
 
+	op := opFromServiceEntryFactory(sdwan.OperationUpdate, curr)
 	currParsedHosts := getHosts(curr)
 	oldParsedHosts := getHosts(old)
 
@@ -96,6 +97,7 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 	for _, currHost := range currParsedHosts {
 		currHosts[currHost] = true
 	}
+	op.Data.ServerNames = currParsedHosts
 
 	oldHosts := map[string]bool{}
 	for _, oldHost := range oldParsedHosts {
@@ -108,18 +110,11 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 		}
 
 		l.Info().Str("reason", "no watch enabled").Msg("sending delete...")
-		s.opsChan <- &sdwan.Operation{
-			Type:            sdwan.OperationRemove,
-			ApplicationName: curr.Name,
-			Servers:         oldParsedHosts,
-		}
+		op.Type = sdwan.OperationDelete
+		s.opsChan <- op
 		return
 	}
 
-	// TODO: this part is a bit complicated and must be taken care with much
-	// more attention, especially if the watchAll changes. Right now it works,
-	// but it will be probably refactored in a cleaner and more understandable
-	// way.
 	if curr.Spec.Location != netv1b1.ServiceEntry_MESH_EXTERNAL {
 		if s.options.WatchAllServiceEntries {
 			if old.Spec.Location != netv1b1.ServiceEntry_MESH_EXTERNAL {
@@ -127,11 +122,8 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 			}
 
 			l.Info().Str("reason", "MESH_INTERNAL detected").Msg("sending delete...")
-			s.opsChan <- &sdwan.Operation{
-				Type:            sdwan.OperationRemove,
-				ApplicationName: curr.Name,
-				Servers:         oldParsedHosts,
-			}
+			op.Type = sdwan.OperationDelete
+			s.opsChan <- op
 			return
 		}
 
@@ -147,19 +139,17 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 					Strs("old-hosts", oldParsedHosts).
 					Msg("sending update...")
 
-				// First, delete...
-				s.opsChan <- &sdwan.Operation{
-					Type:            sdwan.OperationRemove,
-					ApplicationName: curr.Name,
-					Servers:         oldParsedHosts,
+					// TODO: get those that are not there anymore and remove
+					// keep the ones that are still there and do an update
+					// TODO:
+
+				op.PreviousData = &sdwan.ResourceData{
+					ServerNames: oldParsedHosts,
+					Ports:       getPorts(old),
 				}
 
-				// ... then, add
-				s.opsChan <- &sdwan.Operation{
-					Type:            sdwan.OperationAdd,
-					ApplicationName: curr.Name,
-					Servers:         currParsedHosts,
-				}
+				s.opsChan <- op
+				return
 			}
 		}
 	}
@@ -174,11 +164,8 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 		}
 
 		l.Info().Str("reason", "no valid hosts").Msg("sending delete...")
-		s.opsChan <- &sdwan.Operation{
-			Type:            sdwan.OperationRemove,
-			ApplicationName: curr.Name,
-			Servers:         oldParsedHosts,
-		}
+		op.Type = sdwan.OperationDelete
+		s.opsChan <- op
 
 		return
 	}
@@ -192,19 +179,12 @@ func (s *serviceEntryEventHandler) Update(ue event.UpdateEvent, wq workqueue.Rat
 		Strs("old-hosts", oldParsedHosts).
 		Msg("sending update...")
 
-	// First, delete...
-	s.opsChan <- &sdwan.Operation{
-		Type:            sdwan.OperationRemove,
-		ApplicationName: curr.Name,
-		Servers:         oldParsedHosts,
+	op.PreviousData = &sdwan.ResourceData{
+		ServerNames: oldParsedHosts,
+		Ports:       getPorts(old),
 	}
 
-	// ... then, add
-	s.opsChan <- &sdwan.Operation{
-		Type:            sdwan.OperationAdd,
-		ApplicationName: curr.Name,
-		Servers:         currParsedHosts,
-	}
+	s.opsChan <- op
 }
 
 // Delete handles delete events.
@@ -220,8 +200,10 @@ func (s *serviceEntryEventHandler) Delete(de event.DeleteEvent, wq workqueue.Rat
 		return
 	}
 
-	parsedHosts := getHosts(se)
-	if len(parsedHosts) == 0 {
+	op := opFromServiceEntryFactory(sdwan.OperationDelete, se)
+
+	op.Data.ServerNames = getHosts(se)
+	if len(op.Data.ServerNames) == 0 {
 		return
 	}
 
@@ -229,11 +211,7 @@ func (s *serviceEntryEventHandler) Delete(de event.DeleteEvent, wq workqueue.Rat
 		return
 	}
 
-	s.opsChan <- &sdwan.Operation{
-		Type:            sdwan.OperationRemove,
-		ApplicationName: se.Name,
-		Servers:         parsedHosts,
-	}
+	s.opsChan <- op
 }
 
 // Create handles create events.
@@ -250,13 +228,15 @@ func (s *serviceEntryEventHandler) Create(ce event.CreateEvent, wq workqueue.Rat
 		return
 	}
 
-	parsedHosts := getHosts(se)
-	if len(parsedHosts) == 0 {
+	op := opFromServiceEntryFactory(sdwan.OperationAdd, se)
+
+	op.Data.ServerNames = getHosts(se)
+	if len(op.Data.ServerNames) == 0 {
 		l.Debug().Msg("no valid hosts detected: skipping...")
 		return
 	}
 
-	l = l.With().Strs("hosts", parsedHosts).Logger()
+	l = l.With().Strs("hosts", op.Data.ServerNames).Logger()
 	l.Info().Msg("reconciling service entry...")
 
 	if se.Spec.Location != netv1b1.ServiceEntry_MESH_EXTERNAL {
@@ -272,11 +252,7 @@ func (s *serviceEntryEventHandler) Create(ce event.CreateEvent, wq workqueue.Rat
 		l.Warn().Msg("service entry resolution is not DNS")
 	}
 
-	s.opsChan <- &sdwan.Operation{
-		Type:            sdwan.OperationAdd,
-		ApplicationName: se.Name,
-		Servers:         parsedHosts,
-	}
+	s.opsChan <- op
 }
 
 // Generic handles generic events.
@@ -305,4 +281,28 @@ func getHosts(se *vb1.ServiceEntry) (hosts []string) {
 	}
 
 	return hosts
+}
+
+func getPorts(se *vb1.ServiceEntry) []sdwan.ProtocolAndPort {
+	ports := []sdwan.ProtocolAndPort{}
+
+	for _, port := range se.Spec.Ports {
+		ports = append(ports, sdwan.ProtocolAndPort{
+			Port:     port.Number,
+			Protocol: port.Protocol,
+		})
+	}
+
+	return ports
+}
+
+func opFromServiceEntryFactory(opType sdwan.OperationType, se *vb1.ServiceEntry) *sdwan.Operation {
+	return &sdwan.Operation{
+		Type:         opType,
+		ResourceType: vb1.ServiceEntry{}.Kind,
+		ResourceName: se.Name,
+		Data: sdwan.ResourceData{
+			Ports: getPorts(se),
+		},
+	}
 }

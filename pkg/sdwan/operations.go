@@ -20,12 +20,69 @@ package sdwan
 type OperationType string
 
 const (
-	OperationRemove OperationType = "remove"
+	OperationDelete OperationType = "delete"
 	OperationAdd    OperationType = "add"
+	OperationUpdate OperationType = "update"
 )
 
+// type Operation struct {
+// 	Type OperationType
+// 	// DEPRECATED: use ResourceName instead
+// 	ApplicationName string
+
+// 	// ResourceName is the name of the resource that generated the event,
+// 	// *not* its kind or type.
+// 	ResourceName string
+
+// 	// DEPRECATED: use ServerNames instead
+// 	Servers []string
+
+// 	// List of servers, i.e. "api.example.com". Depending on the SDWAN
+// 	// controller, this may be ignored if provided together with IPs.
+// 	ServerNames []string
+
+// 	// List of IPs in a CIDR form, i.e. "10.10.10.0/24". Depending on the
+// 	// SDWAN controller, this may be ignored if provided together with Servers.
+// 	IPs []string
+
+// 	// CustomProbe to use for SDWAN. Can be either an FQDN, i.e.
+// 	// "api.example.com", or a URL, i.e. "https://api.example.com", or an IP,
+// 	// i.e. "10.10.10.21".
+// 	CustomProbe string
+
+// 	// The primary port to use for the servers/ips.
+// 	PrimaryPort int32
+// }
+
 type Operation struct {
-	Type            OperationType
-	ApplicationName string
-	Servers         []string
+	Type OperationType
+
+	ResourceType string
+	ResourceName string
+
+	Data         ResourceData
+	PreviousData *ResourceData
+}
+
+type ResourceData struct {
+	// List of servers, i.e. "api.example.com". Depending on the SDWAN
+	// controller, this may be ignored if provided together with IPs.
+	ServerNames []string
+
+	// List of IPs in a CIDR form, i.e. "10.10.10.0/24". Depending on the
+	// SDWAN controller, this may be ignored if provided together with Servers.
+	IPs []string
+
+	// CustomProbe to use for SDWAN. Can be either an FQDN, i.e.
+	// "api.example.com", or a URL, i.e. "https://api.example.com", or an IP,
+	// i.e. "10.10.10.21".
+	CustomProbe string
+
+	// Ports used for the resource.
+	Ports []ProtocolAndPort
+}
+
+type ProtocolAndPort struct {
+	Port     uint32
+	Protocol string
 }

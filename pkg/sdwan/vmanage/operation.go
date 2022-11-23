@@ -25,576 +25,670 @@ import (
 	"time"
 
 	"github.com/CloudNativeSDWAN/egress-watcher/pkg/sdwan"
-	"github.com/CloudNativeSDWAN/egress-watcher/pkg/sdwan/vmanage/types/approute"
-	"github.com/CloudNativeSDWAN/egress-watcher/pkg/sdwan/vmanage/types/policy"
-	"github.com/CloudNativeSDWAN/egress-watcher/pkg/sdwan/vmanage/types/vsmart"
+	vmanagego "github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go"
+	"github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go/pkg/applist"
+	"github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go/pkg/approute"
+	"github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go/pkg/cloudx"
+	"github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go/pkg/customapp"
+	"github.com/CloudNativeSDWAN/egress-watcher/pkg/vmanage-go/pkg/status"
 	"github.com/rs/zerolog"
 )
 
 const (
 	defaultOpTimeout     time.Duration = 5 * time.Minute
 	defaultReauthTimeout time.Duration = 30 * time.Second
+	customAppListDesc    string        = "Managed by Egress Watcher."
+	maxRetryOperations   int           = 5
 )
 
-func (v *Client) WatchForOperations(mainCtx context.Context, opsChan chan *sdwan.Operation, waitingWindow time.Duration, log zerolog.Logger) error {
-	toRemove, toAdd := []*sdwan.Operation{}, []*sdwan.Operation{}
+type OperationsHandler struct {
+	client        *vmanagego.Client
+	waitingWindow time.Duration
+	log           zerolog.Logger
+}
 
+func NewOperationsHandler(client *vmanagego.Client, waitingWindow time.Duration, log zerolog.Logger) *OperationsHandler {
+	return &OperationsHandler{client, waitingWindow, log}
+}
+
+func (o *OperationsHandler) WatchForOperations(mainCtx context.Context, opsChan chan *sdwan.Operation) error {
+	// ----------------------------------------
+	// Init
+	// ----------------------------------------
+
+	ops := []*sdwan.Operation{}
+	waitingTimer := time.NewTimer(o.waitingWindow)
 	// We stop it immediately, because we only want it to be active
 	// when we have at least one operation.
-	waitingTimer := time.NewTimer(waitingWindow)
 	waitingTimer.Stop()
 
-	log.Info().Msg("worker in free mode")
+	o.log.Info().Msg("worker in free mode")
+
+	// ----------------------------------------
+	// Watch for the operation
+	// ----------------------------------------
 
 	for {
 		select {
+
+		// -- Need to quit?
 		case <-mainCtx.Done():
-			log.Info().Msg("cancel requested")
+			o.log.Err(mainCtx.Err()).Msg("cancel requested")
+			waitingTimer.Stop()
 			return nil
+
+		// -- Received an operation?
 		case op := <-opsChan:
-			log.Info().
+			o.log.Info().
 				Str("type", string(op.Type)).
-				Str("name", op.ApplicationName).
-				Strs("hosts", op.Servers).
+				Str("name", op.ResourceName).
+				Strs("hosts", op.Data.ServerNames).
 				Msg("received operation request")
 
-			if len(toRemove) == 0 && len(toAdd) == 0 {
-				waitingTimer = time.NewTimer(waitingWindow)
-
-				if waitingWindow > 0 {
-					log.Info().Str("waiting-duration", waitingWindow.String()).Msg("starting waiting mode")
+			if len(ops) == 0 {
+				if o.waitingWindow > 0 {
+					o.log.Info().Str("waiting-duration", o.waitingWindow.String()).Msg("starting waiting mode")
 				}
+
+				waitingTimer.Reset(o.waitingWindow)
 			}
 
-			toBeCategorized := []*sdwan.Operation{op}
-
-			for len(opsChan) > 0 && waitingWindow == 0 {
+			ops = append(ops, op)
+			for len(opsChan) > 0 && o.waitingWindow == 0 {
 				// If the waiting window is disabled, then we will try to get
 				// all other pending operations, so we will not only work on
 				// one operation at time: that would be disastrous for
 				// performance!
-				toBeCategorized = append(toBeCategorized, <-opsChan)
+				ops = append(ops, <-opsChan)
 			}
 
-			for _, cat := range toBeCategorized {
-				switch cat.Type {
-				case sdwan.OperationAdd:
-					toAdd = append(toAdd, cat)
-				case sdwan.OperationRemove:
-					toRemove = append(toRemove, cat)
-				default:
-					log.Error().Str("type", string(cat.Type)).Msg("invalid operation type provided: skipping...")
-				}
-			}
+		// -- Need to go into busy mode (i.e. apply configuration on vManage)?
 		case <-waitingTimer.C:
-			log.Info().Msg("worker in busy mode")
-
-			if err := func() error {
-				log.Debug().Msg("checking authentication...")
-				ctx, canc := context.WithTimeout(mainCtx, defaultReauthTimeout)
-				defer canc()
-
-				valid, err := v.Auth().AreTokensStillValid(ctx)
-				if err != nil {
-					return fmt.Errorf("cannot check token validity: %w", err)
-				}
-				if valid {
-					// Tokens still valid.
-					return nil
-				}
-
-				log.Debug().Msg("renewing tokens...")
-				err = v.Auth().RenewTokens(ctx)
-				if err != nil {
-					return fmt.Errorf("could not renew tokens: %w", err)
-				}
-
-				return nil
-			}(); err != nil {
-				// TODO: what to do? Best thing would probably be to panic:
-				// this is a critical part of our program, as we can't do
-				// our job in this case. In next version, we will have sentinel
-				// errors and we will crash only according to what error is
-				// returned (e.g. crash only if we can't renew)
-				log.Err(err).
-					Msg("can't check if tokens are still valid: next operations may fail")
-			}
-
-			doAction := func(ops []*sdwan.Operation) error {
-				ctx, canc := context.WithTimeout(mainCtx, defaultOpTimeout)
-				defer canc()
-
-				var err error
-				if ops[0].Type == sdwan.OperationRemove {
-					err = v.removeApplications(ctx, toRemove, log)
-				} else {
-					err = v.addApplications(ctx, toAdd, log)
-				}
-
-				return err
-			}
-
-			// -- First, remove the ones that must be removed.
-			if len(toRemove) > 0 {
-				if err := doAction(toRemove); err != nil {
-					log.Err(err).Msg("error while removing custom applications")
-				}
-			}
-
-			if mainCtx.Err() != nil {
-				// Avoid adding custom applications, then.
-				return nil
-			}
-
-			// -- The, add the new applications
-			if len(toAdd) > 0 {
-				if err := doAction(toAdd); err != nil {
-					log.Err(err).Msg("error while adding custom applications")
-				}
-			}
+			o.busyMode(mainCtx, ops)
 
 			// Reset
-			toRemove, toAdd = []*sdwan.Operation{}, []*sdwan.Operation{}
-			log.Info().Msg("back in free mode")
+			ops = []*sdwan.Operation{}
+			o.log.Info().Msg("back in free mode")
 		}
 	}
 }
 
-func (v *Client) removeApplications(ctx context.Context, ops []*sdwan.Operation, log zerolog.Logger) error {
-	names := make([]string, len(ops))
-	for i, op := range ops {
-		names[i] = op.ApplicationName
-	}
-	log = log.With().Str("worker", "remover").Logger()
-
-	log.Info().Strs("applications", names).Msg("removing applications, this may take a while...")
-
-	// -- Disable the applictions.
-	pushRequired, err := v.CloudX().DisableApplicationsByName(ctx, names)
+func (o *OperationsHandler) busyMode(ctx context.Context, operations []*sdwan.Operation) {
+	ops, err := o.adaptOperations(ctx, operations)
 	if err != nil {
-		return fmt.Errorf("could not disable applications: %w", err)
+		o.log.Err(err).Msg("error occurred before activating busy mode")
+		return
 	}
+	o.log.Info().Msg("busy mode")
 
-	log.Debug().Strs("applications", names).Msg("applications disabled successfully")
+	appListsNamesToEnable := []string{}
+	appListsNamesToDisable := []string{}
 
-	// -- Now, push the new configuration to Cloud Express.
-	if pushRequired {
-		log.Debug().Msg("a push is required")
-
-		opID, err := v.CloudX().ApplyConfigurationToAllDevices(ctx)
-		if err != nil {
-			return fmt.Errorf("could not apply configuration: %w", err)
-		}
-
-		opl := log.With().Str("operation-id", opID).Logger()
-		opl.Debug().Msg("configuration pushed to all devices")
-
-		opl.Debug().Msg("waiting for operation to complete...")
-		if err := v.Status().WaitUntilOperationCompletes(ctx, opID); err != nil {
-			return fmt.Errorf("error while waiting for operation %s to complete: %w", opID, err)
-		}
-		opl.Debug().Msg("finished")
-	}
-
-	// -- Now get the apps and see where they are referenced.
-	polAppLists := map[string]*policy.ApplicationList{}
-	for _, appName := range names {
-		app, err := v.PolicyApplicationsList().GetApplicationListByName(ctx, appName)
-		if err != nil {
-			return fmt.Errorf(`could not get policy application list with name "%s": %w`, appName, err)
-		}
-
-		polAppLists[app.ID] = app
-	}
-	if len(polAppLists) == 0 {
-		return fmt.Errorf("no policy application lists found")
-	}
-	log.Debug().Int("#", len(polAppLists)).Msg("retrieved the policy applications lists")
-
-	// -- Get the references for each policy application list.
-	appRoutes := map[string]*approute.Policy{}
-	for _, polAppList := range polAppLists {
-		for _, ref := range polAppList.References {
-
-			if ref.ID == "" || !strings.EqualFold(ref.Type, "approute") {
-				// Skip if this is not AppRoute or the ID is empty (it does happen).
-				continue
+	// Create a list of custom application lists that need to be
+	// disabled prior to be deleted.
+	if len(ops.delete) > 0 {
+		appListsNamesToDisable = func() []string {
+			names := []string{}
+			for _, del := range ops.delete {
+				names = append(names, del.ResourceName)
 			}
-
-			if _, exists := appRoutes[ref.ID]; exists {
-				// Skip if we already have this.
-				continue
-			}
-
-			ar, err := v.AppRoute().GetPolicy(ctx, ref.ID)
-			if err != nil {
-				return fmt.Errorf(`could not get approute policy with id %s: %w`, ref.ID, err)
-			}
-
-			appRoutes[ar.DefinitionID] = ar
-		}
-	}
-	if len(appRoutes) == 0 {
-		return fmt.Errorf("no associated AppRoute policies found")
-	}
-	log.Debug().Int("#", len(appRoutes)).Msg("retrieved associated AppRoute policies")
-
-	// -- For each AppRoute found, we need to remove the applications from there.
-	newAppRoutes := []*approute.Policy{}
-	for _, ar := range appRoutes {
-		newAppRoute := *ar
-		newAppRoute.Sequences = []*approute.Sequence{}
-
-		for _, sequence := range ar.Sequences {
-			foundAny := false
-			for _, entry := range sequence.Match.Entries {
-				if _, exists := polAppLists[entry.Reference]; exists {
-					foundAny = true
-					break
-				}
-			}
-
-			if !foundAny {
-				newAppRoute.Sequences = append(newAppRoute.Sequences, sequence)
-			}
-		}
-
-		newAppRoutes = append(newAppRoutes, &newAppRoute)
-	}
-	log.Debug().Msg("parsed and modified AppRoutes before updating")
-
-	// -- Try a bulk update.
-	processID, err := v.AppRoute().BulkUpdate(ctx, newAppRoutes)
-	if err != nil {
-		return fmt.Errorf("could not perform bulk update: %w", err)
-	}
-	log.Debug().Str("process-id", processID).Msg("initialized AppRoute policies bulk update")
-
-	// -- Let's now activate the policies.
-	vsmartPols := map[string]*vsmart.Policy{}
-	{
-		// Get all vsmart policies, instead of pulling them one by one.
-		// TODO: this may be done in another way: get only the vsmart
-		// policies that really apply this and ignore anything else.
-		polIDs := map[string]bool{}
-		for _, ar := range appRoutes {
-			for _, activatedID := range ar.ActivatedIDs {
-				if _, exists := vsmartPols[activatedID]; exists {
-					continue
-				}
-
-				polIDs[activatedID] = true
-			}
-		}
-
-		vpols, err := v.VSmart().ListPolicies(ctx)
-		if err != nil {
-			return fmt.Errorf("could not load vSmart policies: %w", err)
-		}
-
-		for _, vpol := range vpols {
-			if _, exists := polIDs[vpol.ID]; exists {
-				vsmartPols[vpol.ID] = vpol
-			}
-		}
-	}
-	if len(vsmartPols) == 0 {
-		return fmt.Errorf("no vSmart policies found")
-	}
-	log.Debug().Int("#", len(vsmartPols)).Msg("retrieved vSmart policies")
-
-	// -- Now activate each one of them
-	for _, vpol := range vsmartPols {
-		l := log.With().Str("id", vpol.ID).Str("name", vpol.Name).Logger()
-		if err := v.VSmart().UpdateCentralPolicyByID(ctx, vpol.ID, vpol); err != nil {
-			return fmt.Errorf("could not update vSmart central policy: %w", err)
-		}
-		l.Debug().Msg("updated vSmart policy")
-
-		opID, err := v.VSmart().ActivatePolicyByID(ctx, vpol.ID, processID)
-		if err != nil {
-			return fmt.Errorf("could not update vSmart central policy: %w", err)
-		}
-		l.Debug().Str("operation-id", opID).Msg("activated vSmart policy")
-
-		l.Debug().Str("operation-id", opID).Msg("waiting for operation to complete")
-		if err := v.Status().WaitUntilOperationCompletes(ctx, opID); err != nil {
-			return err
-		}
-		l.Debug().Str("operation-id", opID).Msg("finished")
+			return names
+		}()
 	}
 
-	// -- Delete the policy application list.
-	for _, polAppList := range polAppLists {
-		if err := v.
-			PolicyApplicationsList().
-			DeleteApplication(ctx, polAppList.ID); err != nil {
-			return fmt.Errorf("error while deleting application with ID %s: %w", polAppList.ID, err)
-		}
-
-		log.Debug().
-			Str("id", polAppList.ID).
-			Str("name", polAppList.Name).
-			Msg("deleted policy application list")
+	// Create whatever needs to be created.
+	if len(ops.create) > 0 {
+		appListsNamesToEnable = o.handleCreateOps(ctx, ops.create)
 	}
 
-	// -- Delete the custom application.
-	for _, polAppList := range polAppLists {
-		for _, entry := range polAppList.ApplicationEntries {
-			if entry.Name == polAppList.Name && entry.Reference != "" {
-				if err := v.
-					PolicyApplicationsList().
-					DeleteCustomApplication(ctx, entry.Reference); err != nil {
-					return fmt.Errorf("could not delete custom application with ID %s: %w", entry.Reference, err)
-				}
-
-				log.Debug().
-					Str("id", entry.Reference).
-					Str("name", entry.Name).
-					Msg("deleted custom application")
-			}
-		}
+	if len(ops.update) > 0 {
+		o.handleUpdateOps(ctx, ops.update)
 	}
 
-	log.Info().Msg("all done")
+	// Next operation will probably take some time, so let's check if
+	// the user/k8s wants us to quit before taking any action.
+	if ctx.Err() != nil {
+		o.log.Err(ctx.Err()).Msg("stopped before applying new configuration")
+		return
+	}
 
-	return nil
+	// Now do start busy mode
+	if err := o.applyConfiguration(ctx, appListsNamesToEnable, appListsNamesToDisable); err != nil {
+		o.log.Err(err).Msg("error occurred while applying configuration")
+		return
+	}
+
+	if ctx.Err() != nil {
+		o.log.Err(ctx.Err()).Msg("stopped before applying new configuration")
+		return
+	}
+
+	// Now delete other stuff
+	if len(ops.delete) > 0 {
+		o.handleDeleteOps(ctx, ops.delete)
+	}
 }
 
-func (v *Client) addApplications(ctx context.Context, ops []*sdwan.Operation, log zerolog.Logger) error {
-	names := make([]string, len(ops))
-	customApplications := make([]*policy.CustomApplication, len(ops))
-	for i, op := range ops {
-		customApplications[i] = &policy.CustomApplication{
-			Name:        op.ApplicationName,
-			ServerNames: op.Servers,
-		}
-		names[i] = op.ApplicationName
-	}
-	log = log.With().Str("worker", "adder").Logger()
+func (o *OperationsHandler) handleCreateOps(mainCtx context.Context, toCreate []*sdwan.Operation) []string {
+	appListsToEnable := []string{}
 
-	{
-		log.Debug().Msg("checking for existing custom applications before continuing")
-		existingCustomApps, err := v.PolicyApplicationsList().
-			ListCustomApplications(ctx)
-		if err != nil {
-			log.Err(err).Msg("error while checking existing applications: next operations may fail")
-		}
+	// ----------------------------------------
+	// Create the custom applications (and lists)
+	// ----------------------------------------
 
-		for _, exCustApp := range existingCustomApps {
-			for i := 0; i < len(customApplications); i++ {
-				if customApplications[i].Name == exCustApp.Name {
-					customApplications[i].ID = exCustApp.ID
-					log.Debug().
-						Str("app-id", customApplications[i].ID).
-						Str("current-app", customApplications[i].Name).
-						Msg("custom application already exists, skipping creation...")
-				}
-			}
-		}
-	}
-
-	log.Info().Strs("names", names).Msg("adding custom applications, this may take a while...")
-
-	// The next two steps can be done in just one loop, but since this involves
-	// creating two separate resources which reference each other, it's better
-	// to first create all the ones of the same type first, so we can easily
-	// revert later.
-
-	// -- First, create the custom applications.
-	for i, customApp := range customApplications {
-		if customApp.ID != "" {
-			continue
-		}
-
-		appID, err := v.PolicyApplicationsList().
-			CreateCustomApplication(ctx, customApp)
-		if err != nil {
-			return fmt.Errorf("could not create custom application with name %s: %w", customApp.Name, err)
-		}
-		log.Debug().
-			Str("app-id", appID).
-			Str("current-app", customApp.Name).
-			Msg("created custom application and received application ID")
-
-		customApplications[i].ID = appID
-	}
-
-	// -- Create the policy application lists for each custom application.
-	// listIDs is map that associates custom app name -> policy application list ID
-	listIDs := map[string]string{}
-	for _, customApp := range customApplications {
-		// Does it already exist?
-		appList, err := v.PolicyApplicationsList().
-			GetApplicationListByName(ctx, customApp.Name)
-		if err != nil {
-			if !errors.Is(err, sdwan.ErrNotFound) {
-				log.Err(err).
-					Str("current-app", customApp.Name).
-					Msg("error while checking if policy exists, next operations may fail")
-			}
+	for _, create := range toCreate {
+		l := o.log.With().
+			Str("name", create.ResourceName).
+			Logger()
+		if len(create.Data.ServerNames) > 0 {
+			l = l.With().Str("host", create.Data.ServerNames[0]).Logger()
 		} else {
-			log.Debug().
-				Str("list-id", appList.ID).
-				Str("current-app", customApp.Name).
-				Msg("a policy application list already exists for this: skipping...")
-			listIDs[customApp.Name] = appList.ID
+			l = l.With().Strs("ips", create.Data.IPs).Logger()
+		}
+
+		l.Debug().Msg("creating custom application...")
+
+		appID, err := o.client.CustomApplications().
+			Create(mainCtx, customapp.CreateUpdateOptions{
+				Name:        create.ResourceName,
+				ServerNames: create.Data.ServerNames,
+				L3L4Attributes: func() customapp.L3L4Attributes {
+					if len(create.Data.IPs) == 0 {
+						return customapp.L3L4Attributes{}
+					}
+
+					return customapp.L3L4Attributes{
+						TCP: func() []customapp.IPsAndPorts {
+							ports := []int32{}
+							for _, port := range create.Data.Ports {
+								ports = append(ports, int32(port.Port))
+							}
+
+							return []customapp.IPsAndPorts{
+								{IPs: create.Data.IPs, Ports: &customapp.Ports{Values: ports}},
+							}
+						}(),
+					}
+				}(),
+			})
+		if err != nil {
+			l.Err(err).Msg("cannot create custom application: skipping...")
+			continue
+		}
+
+		l.Info().Str("id", *appID).
+			Msg("custom application successfully created")
+		l = l.With().Logger()
+		l.Debug().Msg("creating custom application list...")
+
+		applistID, err := o.client.ApplicationLists().
+			Create(mainCtx, applist.CreateUpdateOptions{
+				Name:        create.ResourceName,
+				Description: customAppListDesc,
+				Applications: []applist.Application{
+					{
+						Name: create.ResourceName,
+						ID:   *appID,
+					},
+				},
+				Probe: getProbe(*create),
+			})
+		if err != nil {
+			l.Err(err).Msg("cannot create custom application list, " +
+				"removing custom application just created...")
+
+			if err := o.client.CustomApplications().Delete(mainCtx, *appID); err != nil {
+				l.Err(err).Msg("cannot delete custom application")
+			}
 
 			continue
 		}
 
-		listID, err := v.
-			PolicyApplicationsList().
-			CreatePolicyApplicationList(ctx, customApp)
+		l.Info().Str("id", *applistID).
+			Msg("custom application list successfully created")
+		appListsToEnable = append(appListsToEnable, create.ResourceName)
+	}
+
+	return appListsToEnable
+}
+
+func (o *OperationsHandler) handleDeleteOps(mainCtx context.Context, toDelete []*sdwan.Operation) {
+	// Get application lists ID to delete
+	listsToDelete := map[string]*applist.ApplicationList{}
+	lists, _ := o.client.ApplicationLists().List(mainCtx)
+	for _, list := range lists {
+		for _, del := range toDelete {
+			if del.ResourceName == list.Name {
+				listsToDelete[list.Name] = list
+			}
+		}
+	}
+
+	for _, list := range listsToDelete {
+		l := o.log.With().Str("id", list.ID).Str("name", list.Name).Logger()
+		if list.ReferenceCount > 0 {
+			l.Warn().Int("references", list.ReferenceCount).
+				Msg("application list will not be deleted because it is " +
+					"referenced somewhere else")
+			continue
+		}
+
+		// Get ID of apps to delete
+		appIDs := []string{}
+		for _, apps := range list.Applications {
+			appIDs = append(appIDs, apps.ID)
+		}
+
+		l.Debug().Msg("deleting application list...")
+		if err := o.client.ApplicationLists().
+			Delete(mainCtx, list.ID); err != nil {
+			l.Err(err).Msg("cannot delete custom application list")
+			continue
+		}
+		l.Info().Msg("custom application list successfully deleted")
+
+		for _, appID := range appIDs {
+			l := o.log.With().Str("application-id", appID).Logger()
+
+			err := o.client.CustomApplications().Delete(mainCtx, appID)
+			if err != nil {
+				l.Err(err).Msg("cannot delete custom application")
+			} else {
+				l.Info().Msg("successfully deleted")
+			}
+		}
+	}
+}
+
+func (o *OperationsHandler) handleUpdateOps(mainCtx context.Context, toUpdate []*sdwan.Operation) {
+	log := o.log.With().Str("handler", "updater").Logger()
+	log.Info().Msg("handling updates...")
+
+	for _, upd := range toUpdate {
+		l := log.With().
+			Str("server-name", upd.Data.ServerNames[0]).
+			Str("custom-application-name", upd.ResourceName).
+			Logger()
+
+		ca, err := o.client.CustomApplications().GetByName(mainCtx, upd.ResourceName)
 		if err != nil {
-			return fmt.Errorf("could not create policy appliction list with name %s: %w", customApp.Name, err)
+			l.Err(err).Msg("could not get custom application, skipping...")
+			continue
 		}
-		log.Debug().
-			Str("list-id", listID).
-			Str("current-app", customApp.Name).
-			Msg("created policy application list and received list ID")
 
-		listIDs[customApp.Name] = listID
-	}
+		l.Debug().Msg("updating custom application...")
+		caOpts := ca.GetCreateUpdateOptions()
+		// TODO: set data
+		caOpts.ServerNames = upd.Data.ServerNames
+		if err := o.client.CustomApplications().Update(mainCtx, ca.ID, caOpts); err != nil {
+			l.Err(err).Msg("could not update custom application")
+			continue
+		}
+		l.Info().Msg("custom application updated successfully")
 
-	// -- Enable the applications.
-	pushRequired, err := v.CloudX().EnableApplicationsByName(ctx, names)
-	if err != nil {
-		return fmt.Errorf("could not enabled applications: %w", err)
-	}
-	log.Debug().Msg("applications enabled successfully")
+		l = log.With().
+			Str("custom-application-list-name", upd.ResourceName).
+			Str("server-name", upd.Data.ServerNames[0]).
+			Logger()
 
-	if pushRequired {
-		log.Debug().Msg("a push is required")
-
-		opID, err := v.CloudX().ApplyConfigurationToAllDevices(ctx)
+		al, err := o.client.ApplicationLists().GetByName(mainCtx, upd.ResourceName)
 		if err != nil {
-			return fmt.Errorf("could not apply configuration: %w", err)
+			l.Err(err).Msg("could not get custom application list, skipping...")
 		}
-		opl := log.With().Str("operation-id", opID).Logger()
-		opl.Debug().Msg("configuration pushed to all devices")
 
-		opl.Debug().Msg("waiting for operation to complete")
-		if err := v.Status().WaitUntilOperationCompletes(ctx, opID); err != nil {
-			return fmt.Errorf("could not get status of operation %s: %w", opID, err)
+		l.Debug().Msg("updating custom application list...")
+		opts := al.GetCreateUpdateOptions()
+		opts.Probe = getProbe(*upd)
+		if err := o.client.ApplicationLists().Update(mainCtx, al.ID, opts); err != nil {
+			l.Err(err).Msg("could not update custom application list")
+		} else {
+			l.Info().Msg("custom application updated successfully")
 		}
-		opl.Debug().Msg("finished")
+	}
+}
+
+func (o *OperationsHandler) applyConfiguration(mainCtx context.Context, toEnable, toDisable []string) error {
+	if len(toEnable) == 0 && len(toDisable) == 0 {
+		o.log.Info().Msg("no configuration to apply, skipping...")
+		return nil
 	}
 
-	// -- Get all vSmart policies.
-	vsmartPolicies, err := v.VSmart().ListPolicies(ctx)
+	o.log.Debug().Msg("toggling applications...")
+	pushRequired, err := o.client.CloudExpress().Applications().
+		Toggle(mainCtx, cloudx.ToggleOptions{
+			Enable:  toEnable,
+			Disable: toDisable,
+		})
 	if err != nil {
-		return fmt.Errorf("could not load list of approute policies: %w", err)
+		return fmt.Errorf("error while toggling applications: %w", err)
 	}
-	if len(vsmartPolicies) == 0 {
-		return fmt.Errorf("no vSmart policies found")
+
+	if !pushRequired {
+		// TODO: should we just avoid applying configuration or return like
+		// we are doing now?
+		o.log.Info().Msg("no push is required")
+		return nil
 	}
-	log.Debug().Int("#", len(vsmartPolicies)).Msg("retrieved vSmart policies")
 
-	// -- Get AppRoutes associated with.
-	appRoutes := []*approute.Policy{}
-	for _, vpol := range vsmartPolicies {
-		for _, asm := range vpol.Definition.Assemblies {
+	o.log.Info().Msg("applying configuration to all devices...")
+	operationID, err := o.client.CloudExpress().Devices().
+		ApplyConfigurationToAllDevices(mainCtx)
+	if err != nil {
+		return fmt.Errorf("cannot apply configuration to devices: %w", err)
+	}
 
-			alreadyThere := false
-			for _, appr := range appRoutes {
-				if appr.DefinitionID == asm.DefinitionId {
-					alreadyThere = true
-				}
+	o.log.Info().Str("operation-id", *operationID).Msg("waiting for operation to complete...")
+	summary, err := o.client.Status().WaitForOperationToFinish(mainCtx, status.WaitOptions{
+		OperationID: *operationID,
+	})
+	if err != nil {
+		return fmt.Errorf("error while checking operation id: %w", err)
+	}
+	o.log.Debug().Str("status-summary", summary.Status).Msg("finished")
+
+	o.log.Debug().Msg("getting approute policies to update")
+	appRoutePols, err := o.client.AppRoute().List(context.Background())
+	if err != nil {
+		return fmt.Errorf("cannot get list of approutes: %w", err)
+	}
+	o.log.Info().Msg("retrieved list of approutes policies")
+
+	for _, arPol := range appRoutePols {
+		processID, err := o.client.AppRoute().
+			UpdateApplicationListsOnPolicy(mainCtx, arPol.ID, approute.AddRemoveAppListOptions{
+				Add:    toEnable,
+				Remove: toDisable,
+			})
+		if err != nil {
+			return fmt.Errorf("cannot update approute policy %s (ID %s): %w", arPol.Name, arPol.ID, err)
+		}
+		o.log.Info().Str("approute-policy", arPol.Name).
+			Str("process-id", *processID).
+			Msg("successfully updated approute policy and received process ID")
+
+		for _, activatedID := range arPol.ActivatedByVSmartPolicies {
+			vpol, err := o.client.VSmartPolicies().Get(mainCtx, activatedID)
+			if err != nil {
+				return fmt.Errorf("cannot get vSmart policy with ID %s: %w", activatedID, err)
+			}
+			l := o.log.With().Str("vSmart-policy-name", vpol.Name).Str("vSmart-policy-ID", vpol.ID).Logger()
+
+			if err := o.client.VSmartPolicies().
+				UpdateCentralPolicy(context.Background(), *vpol); err != nil {
+				return fmt.Errorf("cannot update vSmart policy %s (ID %s): %w", vpol.Name, vpol.ID, err)
+			}
+			l.Info().Msg("successfully updated vSmart policy")
+
+			operationID, err := o.client.VSmartPolicies().
+				ActivatePolicy(context.Background(), vpol.ID, *processID)
+			if err != nil {
+				return fmt.Errorf("cannot activate vSmart policy policy %s (ID %s): %w", vpol.Name, vpol.ID, err)
+			}
+			l.Info().Str("operation-ID", *operationID).
+				Msg("waiting for vManage to activate vSmart policy...")
+
+			summary, err := o.client.Status().
+				WaitForOperationToFinish(mainCtx, status.WaitOptions{
+					OperationID: *operationID,
+				})
+			if err != nil {
+				return fmt.Errorf("cannot check operation status: %w", err)
 			}
 
-			if alreadyThere {
+			l.Info().Str("status-summary", summary.Status).Msg("finished activating vSmart policy")
+		}
+	}
+
+	return err
+}
+
+type parsedOperationsResult struct {
+	create []*sdwan.Operation
+	update []*sdwan.Operation
+	delete []*sdwan.Operation
+}
+
+func (o *OperationsHandler) adaptOperations(ctx context.Context, toCategorize []*sdwan.Operation) (*parsedOperationsResult, error) {
+	parsedResults := &parsedOperationsResult{
+		create: []*sdwan.Operation{},
+		update: []*sdwan.Operation{},
+		delete: []*sdwan.Operation{},
+	}
+
+	customApps, err := o.client.CustomApplications().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	caMap := func() map[string]*customapp.CustomApplication {
+		m := map[string]*customapp.CustomApplication{}
+		for _, app := range customApps {
+			m[app.Name] = app
+		}
+		return m
+	}()
+
+	// Before categorizing the operation, we need to split updates. This is
+	// because we have a custom application per server name.
+	// TODO: must be done for the IPs as well
+	newUpds := []*sdwan.Operation{}
+	newDels := []*sdwan.Operation{}
+	newCreate := []*sdwan.Operation{}
+	for _, cat := range toCategorize {
+		if cat.Type == sdwan.OperationUpdate {
+			updRes := splitUpdateOperations(cat)
+			if len(updRes.update) > 0 {
+				newUpds = append(newUpds, updRes.update...)
+			}
+			if len(updRes.delete) > 0 {
+				newDels = append(newDels, updRes.delete...)
+			}
+			if len(updRes.create) > 0 {
+				newCreate = append(newCreate, updRes.create...)
+			}
+		}
+	}
+
+	if len(newUpds) > 0 {
+		toCategorize = append(toCategorize, newUpds...)
+	}
+	if len(newDels) > 0 {
+		toCategorize = append(toCategorize, newDels...)
+	}
+	if len(newCreate) > 0 {
+		toCategorize = append(toCategorize, newCreate...)
+	}
+
+	acceptedProtos := map[string]bool{
+		"http":  true,
+		"https": true,
+		"tls":   true,
+		"grpc":  true,
+		"http2": true,
+		"tcp":   true,
+	}
+
+	// Categorize the operation: things that need to be created and
+	// ones that must be deleted.
+	for _, cat := range toCategorize {
+		// First, is the protocol supported by vManage?
+		// TODO: move this up in the select case before busy mode
+		parsedPorts := []sdwan.ProtocolAndPort{}
+		for _, port := range cat.Data.Ports {
+			if _, exists := acceptedProtos[strings.ToLower(port.Protocol)]; exists {
+				parsedPorts = append(parsedPorts, port)
+			}
+		}
+		if len(parsedPorts) == 0 {
+			o.log.Err(errors.New("no supported protocols found")).
+				Str("name", cat.ResourceName).Msg("error occurred while parsing protocols: skipping...")
+			continue
+		}
+
+		for _, serverName := range cat.Data.ServerNames {
+			if serverName == "" {
 				continue
 			}
 
-			ar, err := v.AppRoute().GetPolicy(ctx, asm.DefinitionId)
-			if err != nil {
-				return fmt.Errorf("could not load approute with ID %s: %w", asm.DefinitionId, err)
+			// We're going to create a custom application for each host we
+			// find, and we're going to call it based on the host itself.
+			// e.g.: "api.example.com" will be "api_example_com".
+			name := replaceDots(serverName)
+
+			// Recreate the operation
+			op := *cat
+			op.ResourceName = name
+			op.Data.ServerNames = []string{serverName}
+			op.Data.Ports = parsedPorts
+
+			switch cat.Type {
+			case sdwan.OperationAdd:
+				if _, exists := caMap[name]; exists {
+					op.Type = sdwan.OperationUpdate
+				}
+
+				parsedResults.create = append(parsedResults.create, &op)
+			case sdwan.OperationUpdate:
+				if op.PreviousData == nil {
+					// Note that we take a differente approach with updates
+					// (above), and when we parse updates we also remove the
+					// previous data because we don't use it. With this check
+					// we make sure we skip those un-parsed operations.
+					parsedResults.update = append(parsedResults.update, &op)
+				}
+			case sdwan.OperationDelete:
+				if _, exists := caMap[name]; exists {
+					parsedResults.delete = append(parsedResults.delete, &op)
+				}
 			}
-
-			appRoutes = append(appRoutes, ar)
-		}
-	}
-	if len(appRoutes) == 0 {
-		return fmt.Errorf("no AppRoutes policies found")
-	}
-	log.Debug().Int("#", len(appRoutes)).Msg("retrieved AppRoute policies found")
-
-	// -- Bulk update.
-	newAppRoutes := []*approute.Policy{}
-	for _, appRoute := range appRoutes {
-		ar := *appRoute
-
-		sequenceID := 1
-		if len(ar.Sequences) > 0 {
-			sequenceID = ar.Sequences[len(ar.Sequences)-1].ID + 10
 		}
 
-		// TODO: Technically this is not wrong, but there must be some entity
-		// or endpoint that that can do this for us. Reasearch this.
-		for customAppName, listID := range listIDs {
-			ar.Sequences = append(ar.Sequences, &approute.Sequence{
-				ID:     sequenceID,
-				Name:   "App Route",
-				Type:   "appRoute",
-				IPType: "ipv4",
-				Match: &approute.Match{
-					Entries: []*approute.Entry{
-						{
-							Field:     "saasAppList",
-							Reference: listID,
-						},
-					},
-				},
-				Actions: []*approute.Action{
-					{
-						Type:      "cloudSaas",
-						Parameter: "",
-					},
-					{
-						Type:      "count",
-						Parameter: fmt.Sprintf("%s_ctr", customAppName),
-					},
-				},
-			})
-			sequenceID += 10
+		// Now do IPs
+		if len(cat.Data.IPs) > 0 {
+			op := *cat
+			op.ResourceName = replaceDots(cat.Data.IPs[0])
+			op.Data.IPs = cat.Data.IPs
+			op.Data.Ports = parsedPorts
 		}
 
-		newAppRoutes = append(newAppRoutes, &ar)
-	}
-	log.Debug().Msg("parsed and modified approutes before bulk update")
-
-	processID, err := v.AppRoute().BulkUpdate(ctx, newAppRoutes)
-	if err != nil {
-		return fmt.Errorf("could not bulk update: %w", err)
-	}
-	log.Debug().
-		Str("pocess-id", processID).
-		Msg("performed a bulk update and received processID")
-
-	// -- Update the vsmart policies.
-	for _, vpol := range vsmartPolicies {
-		l := log.With().Str("id", vpol.ID).Str("name", vpol.Name).Logger()
-
-		if err := v.VSmart().UpdateCentralPolicyByID(ctx, vpol.ID, vpol); err != nil {
-			return fmt.Errorf("could not update vSmart central policy: %w", err)
-		}
-		l.Debug().Msg("updated vSmart policy")
-
-		opID, err := v.VSmart().ActivatePolicyByID(ctx, vpol.ID, processID)
-		if err != nil {
-			return fmt.Errorf("could not update vSmart central policy: %w", err)
-		}
-		l.Debug().Str("operation-id", opID).Msg("activated vSmart policy")
-
-		l.Debug().Str("operation-id", opID).Msg("waiting for operation to complete")
-		if err := v.Status().WaitUntilOperationCompletes(ctx, opID); err != nil {
-			return err
-		}
-		l.Debug().Str("operation-id", opID).Msg("finished")
 	}
 
-	log.Info().Msg("all done")
+	return parsedResults, nil
+}
 
-	return nil
+func splitUpdateOperations(op *sdwan.Operation) parsedOperationsResult {
+	split := parsedOperationsResult{
+		create: []*sdwan.Operation{},
+		update: []*sdwan.Operation{},
+		delete: []*sdwan.Operation{},
+	}
+
+	for _, currServName := range op.Data.ServerNames {
+		found := false
+		parsedOp := &sdwan.Operation{
+			ResourceType: op.ResourceType,
+			ResourceName: replaceDots(currServName),
+			Data: sdwan.ResourceData{
+				ServerNames: []string{currServName},
+				Ports:       op.Data.Ports,
+			},
+		}
+
+		for _, prevServerName := range op.PreviousData.ServerNames {
+			if currServName == prevServerName {
+				parsedOp.Type = sdwan.OperationUpdate
+				split.update = append(split.update, parsedOp)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			parsedOp.Type = sdwan.OperationAdd
+			split.create = append(split.create, parsedOp)
+		}
+	}
+
+	for _, prevServName := range op.PreviousData.ServerNames {
+		found := false
+		parsedOp := &sdwan.Operation{
+			ResourceType: op.ResourceType,
+			ResourceName: replaceDots(prevServName),
+			Data: sdwan.ResourceData{
+				ServerNames: []string{prevServName},
+				Ports:       op.Data.Ports,
+			},
+		}
+
+		for _, currServName := range op.Data.ServerNames {
+			if prevServName == currServName {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			parsedOp.Type = sdwan.OperationDelete
+			split.delete = append(split.delete, parsedOp)
+		}
+	}
+
+	return split
+}
+
+func replaceDots(hostName string) string {
+	return strings.ReplaceAll(
+		strings.ReplaceAll(hostName, ".", "_"),
+		"*", "_")
+}
+
+func getProbe(op sdwan.Operation) applist.Probe {
+	if len(op.Data.IPs) > 0 {
+		return applist.Probe{
+			Type:  applist.IPProbe,
+			Value: op.Data.IPs[0],
+		}
+	}
+
+	serverName := op.Data.ServerNames[0]
+	if strings.Contains(serverName, "*") {
+		serverName = serverName[2:]
+	}
+
+	// Default probe
+	probeType := applist.FQDNProbe
+	value := serverName
+
+	for _, port := range op.Data.Ports {
+		switch port.Port {
+		case 80:
+			switch strings.ToLower(port.Protocol) {
+			case "http":
+				probeType = applist.URLProbe
+				value = "http://" + serverName
+			case "https":
+				probeType = applist.URLProbe
+				value = "https://" + serverName
+			}
+		case 443:
+			switch strings.ToLower(port.Protocol) {
+			case "http":
+				// This is probably a corner case.
+				probeType = applist.URLProbe
+				value = "http://" + serverName
+			case "https":
+				// In this case we return immediately because https takes
+				// precedence.
+				return applist.Probe{
+					Type:  applist.URLProbe,
+					Value: "https://" + serverName,
+				}
+			}
+		}
+	}
+
+	return applist.Probe{
+		Type:  probeType,
+		Value: value,
+	}
 }
