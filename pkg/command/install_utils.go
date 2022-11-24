@@ -37,13 +37,8 @@ func createNamespace(clientset *kubernetes.Clientset, usernamespace string) erro
 		},
 	}
 
-	if nsOut, err := clientset.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{}); err != nil {
-		return err
-	} else {
-		fmt.Printf("Created Namespace %v.\n", nsOut.GetObjectMeta().GetName())
-	}
-
-	return nil
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+	return err
 }
 
 func createServiceAccount(clientset *kubernetes.Clientset, usernamespace, name string) error {
@@ -58,12 +53,8 @@ func createServiceAccount(clientset *kubernetes.Clientset, usernamespace, name s
 		},
 	}
 
-	if serviceAccountOut, err := clientset.CoreV1().ServiceAccounts(usernamespace).Create(context.TODO(), servacc, metav1.CreateOptions{}); err != nil {
-		return err
-	} else {
-		fmt.Printf("Created serviceaccount %v.\n", serviceAccountOut.GetObjectMeta().GetName())
-	}
-	return nil
+	_, err := clientset.CoreV1().ServiceAccounts(usernamespace).Create(context.TODO(), servacc, metav1.CreateOptions{})
+	return err
 }
 
 func createClusterRole(clientset *kubernetes.Clientset, usernamespace, name string) error {
@@ -90,13 +81,8 @@ func createClusterRole(clientset *kubernetes.Clientset, usernamespace, name stri
 		},
 	}
 
-	if clusterRoleOut, err := clientset.RbacV1().ClusterRoles().Create(context.TODO(), cr, metav1.CreateOptions{}); err != nil {
-		return err
-	} else {
-		fmt.Printf("Created clusterRole %v.\n", clusterRoleOut.GetObjectMeta().GetName())
-	}
-
-	return nil
+	_, err := clientset.RbacV1().ClusterRoles().Create(context.TODO(), cr, metav1.CreateOptions{})
+	return err
 }
 
 func createClusterRoleBinding(clientset *kubernetes.Clientset, usernamespace, name string) error {

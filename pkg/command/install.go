@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -117,12 +118,26 @@ func getInstallCommand() *cobra.Command {
 }
 
 func install(clientset *kubernetes.Clientset, docker_image string, opt Options) error {
+	logLevels := [3]zerolog.Level{
+		zerolog.DebugLevel,
+		zerolog.InfoLevel,
+		zerolog.ErrorLevel,
+	}
+
+	if opt.PrettyLogs {
+		log = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+	} else {
+		log = zerolog.New(os.Stderr).With().Timestamp().Logger()
+	}
+	log = log.Level(logLevels[opt.Verbosity])
+	log.Info().Msg("starting...")
 
 	//TODO: Add a cleanup function
 	log.Info().Msg("Attempting namespace creation")
 	if err := createNamespace(clientset, usernamespace); err != nil {
 		return err
 	}
+	log.Info().Str("namespace-name", usernamespace).Msg("namespace created successfully")
 
 	log.Info().Msg("Attempting secret creation")
 	if err := createSecret(clientset, usernamespace, "vmanage-credentials", opt); err != nil {
@@ -172,7 +187,6 @@ func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
 		return err
 	}
 	sdwan_password := string(bytePassword)
-	fmt.Printf(sdwan_password)
 
 	//Baseurl
 	fmt.Println("Please enter your sdwan base_url :")
@@ -186,8 +200,7 @@ func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
 		fmt.Println("Please enter the waiting time in h/m/s:")
 
 		fmt.Scanln(&waittime)
-		sdwan_waittime, err := time.ParseDuration(waittime)
-		_ = sdwan_waittime
+		sdwan_waittime, err = time.ParseDuration(waittime)
 		if err != nil {
 			fmt.Print(err)
 		} else {
@@ -197,38 +210,55 @@ func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
 
 	//self signed certificate
 	sdwan_insecure := true
+
+selfSignedInput:
 	for {
 		fmt.Println("Do you want to accept self-signed certificates?[y/n] default[n]")
 
 		var user_input string
 		fmt.Scanln(&user_input)
 
-		if user_input == "y" || user_input == "Y" {
+		switch strings.ToLower(user_input) {
+		case "y":
 			sdwan_insecure = false
-			break
-		} else if user_input == "" || user_input == "n" || user_input == "N" {
-			break
+			break selfSignedInput
+		case "", "n":
+			break selfSignedInput
 		}
+
+		// if user_input == "y" || user_input == "Y" {
+		// 	sdwan_insecure = false
+		// 	break
+		// } else if user_input == "" || user_input == "n" || user_input == "N" {
+		// 	break
+		// }
 	}
 
 	// Verbosity
 	fmt.Println("Please enter the verbosity level 0,1,2 :")
-	var sdwan_verbosity int64
+	var sdwan_verbosity int
 	fmt.Scanln(&sdwan_verbosity)
+
+	if sdwan_verbosity < 0 || sdwan_verbosity > 2 {
+		fmt.Println("invalid verbosity level provided, using default")
+		sdwan_verbosity = 0
+	}
 
 	// PrettyLogs
 	sdwan_prettylogs := false
+prettyLogsInput:
 	for {
 		fmt.Println("Do you need pretty logs?[y/n] default[n]")
 
 		var user_input string
 		fmt.Scanln(&user_input)
 
-		if user_input == "y" || user_input == "Y" {
-			sdwan_prettylogs = true
-			break
-		} else if user_input == "" || user_input == "n" || user_input == "N" {
-			break
+		switch strings.ToLower(user_input) {
+		case "y":
+			sdwan_prettylogs = false
+			break prettyLogsInput
+		case "", "n":
+			break prettyLogsInput
 		}
 	}
 
@@ -258,29 +288,6 @@ func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
 		docker_image = user_input
 	}
 
-	var log zerolog.Logger
-	{
-		logLevels := [3]zerolog.Level{
-			zerolog.DebugLevel,
-			zerolog.InfoLevel,
-			zerolog.ErrorLevel,
-		}
-
-		if sdwan_verbosity < 0 || sdwan_verbosity > 2 {
-			fmt.Println("invalid verbosity level provided, using default")
-			sdwan_verbosity = 0
-		}
-
-		if sdwan_prettylogs {
-			log = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
-		} else {
-			log = zerolog.New(os.Stderr).With().Timestamp().Logger()
-		}
-
-		log = log.Level(logLevels[sdwan_verbosity])
-		log.Info().Msg("starting...")
-	}
-
 	opt := Options{
 		ServiceEntryController: &controllers.ServiceEntryOptions{
 			WatchAllServiceEntries: watchall_serviceentries,
@@ -295,8 +302,9 @@ func installInteractivelyToK8s(clientset *kubernetes.Clientset) error {
 				Password: sdwan_password,
 			},
 		},
+		PrettyLogs: sdwan_prettylogs,
+		Verbosity:  sdwan_verbosity,
 	}
 
 	return install(clientset, docker_image, opt)
-
 }
